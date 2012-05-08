@@ -1,5 +1,7 @@
+#include <cstddef>
+
 namespace vfs {
 
-void ForEachFile(const char *dirname, void cb(const char *));
+void ForEachFile(const char* dirname, void *, bool recursive = true, void* data = NULL);
 
 }

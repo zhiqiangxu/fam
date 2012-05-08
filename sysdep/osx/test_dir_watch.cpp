@@ -3,7 +3,6 @@
 #include <map>
 #include <unistd.h>
 #include <cstdlib>
-#include <sys/inotify.h>
 #include <pthread.h>
 #include <errno.h>
 #include <stddef.h>
@@ -19,23 +18,14 @@ void onsig(int signal)
 extern "C" int main(int argc, char* argv[])
 {
 	PDirWatch dirWatch1;
-	PDirWatch dirWatch2;
     DirWatchNotifications notifications;
     signal(SIGINT, onsig);
-    if (0 != dir_watch_Add("/home/shore/lab/test/c/fam", dirWatch1))
+    if (0 != dir_watch_Add("/Users/xuzhiqiang/Develop/c/fam/sysdep/osx/", dirWatch1))
     {
 		std::cerr << "dir_watch_Add fail" << std::endl;
 		return EXIT_FAILURE;
     }
     std::cout << "dirWatch1 OK" << std::endl;
-    if (0 != dir_watch_Add("/home/shore/lab/test/c", dirWatch2))
-    {
-		std::cerr << "dir_watch_Add fail" << std::endl;
-		return EXIT_FAILURE;
-    }
-    std::cout << "dirWatch2 OK" << std::endl;
-
-    std::cout << "dir_watch_Add OK" << std::endl;
     do {
         sleep(4);
         if (0 != dir_watch_Poll(notifications))
@@ -67,7 +57,6 @@ extern "C" int main(int argc, char* argv[])
     } while(true);
 
     dirWatch1.reset();
-    dirWatch2.reset();
 
     return 0;
 }

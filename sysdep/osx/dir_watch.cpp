@@ -1,99 +1,36 @@
 #include <iostream>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreServices/CoreServices.h>
-#include "file_utils.h"
 #include <pthread.h>
+#include <sys/types.h>
+#include <sys/event.h>
+#include <sys/time.h>
+#include <sys/stat.h>
+#include <vector>
+#include <map>
+#include <string.h>
+#include <limits.h>
+#include <libgen.h>
+#include "dir_watch.h"
+#include "file_utils.h"
 
 
-// ----------------- run loop signal handling stuff ---------------------
-CFFileDescriptorRef   kq_cffd   = NULL;
-CFRunLoopSourceRef    kq_rl_src = NULL;
-int                   kq_fd     = -1;
-CFRunLoopRef loop = NULL;
 
-static void kq_cffd_callback(CFFileDescriptorRef kq_cffd, CFOptionFlags callBackTypes, void *)
+int dir_watch_Delete(const char* path)
 {
-    CFRunLoopStop(loop);
-}
-
-int setup_run_loop_signal_handler()
-{
-    CFFileDescriptorContext my_context;
-    struct kevent           kev[4];
-
-    kq_fd = kqueue();
-    if (kq_fd < 0) 
-    {
-	    return -1;
-    }
-
-    EV_SET(&kev[0], SIGINT,  EVFILT_SIGNAL, EV_ADD, 0, 0, 0);
-    EV_SET(&kev[1], SIGQUIT, EVFILT_SIGNAL, EV_ADD, 0, 0, 0);
-    EV_SET(&kev[2], SIGTERM, EVFILT_SIGNAL, EV_ADD, 0, 0, 0);
-    EV_SET(&kev[3], SIGHUP,  EVFILT_SIGNAL, EV_ADD, 0, 0, 0);
-
-    if (kevent(kq_fd, &kev[0], 4, NULL, 0, NULL) != 0) 
-    {
-        close(kq_fd);
-        return -1;
-    }
-    
-    memset(&my_context, 0, sizeof(CFFileDescriptorContext));
-    my_context.info = (void *)loop;
-
-    kq_cffd = CFFileDescriptorCreate(NULL, kq_fd, 1, kq_cffd_callback, &my_context);
-    if (kq_cffd == NULL) 
-    {
-        close(kq_fd);
-        return -1;
-    }
-
-    kq_rl_src = CFFileDescriptorCreateRunLoopSource(NULL, kq_cffd, (CFIndex)0);
-    if (kq_rl_src == NULL) 
-    {
-        // Dispose the kq_cffd
-        CFFileDescriptorInvalidate(kq_cffd);
-        CFRelease(kq_cffd);
-        kq_cffd = NULL;
-
-        return -1;
-    }
-
-    CFRunLoopAddSource(loop, kq_rl_src, kCFRunLoopDefaultMode);
-    CFFileDescriptorEnableCallBacks(kq_cffd, kCFFileDescriptorReadCallBack);
-
     return 0;
-}
-
-void cleanup_run_loop_signal_handler(CFRunLoopRef loop)
-{
-    CFRunLoopRemoveSource(loop, kq_rl_src, kCFRunLoopDefaultMode);
-
-    CFFileDescriptorInvalidate(kq_cffd);
-    CFRelease(kq_rl_src);
-    CFRelease(kq_cffd);
-    close(kq_fd);
-
-    kq_rl_src = NULL;
-    kq_cffd   = NULL;
-    kq_fd     = -1;
 }
 
 struct DirWatch
 {
-	DirWatch()
-	{
-	}
+    DirWatch()
+    {
+    }
 
-	~DirWatch()
-	{
-        // Although it's not strictly necessary, make sure we see any pending events... 
-        FSEventStreamFlushSync(stream);
-        FSEventStreamStop(stream);
-        FSEventStreamInvalidate(stream);
-        FSEventAStreamRelease(stream);
-        stream = NULL;
-	}
+    ~DirWatch()
+    {
+        dir_watch_Delete(path.c_str());
+    }
 
     std::string path;
 };
@@ -101,100 +38,227 @@ struct DirWatch
 
 static pthread_t g_event_loop_thread;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
-struct NotificationEvent
-{
-	std::string filename;
-    FSEventStreamEventId id;
-    FSEventStreamEventFlags flags;
-};
-static std::vector<NotificationEvent> g_notifications;
-CFMutableArrayRef     g_paths;
+static std::vector<DirWatchNotification> g_notifications;
+CFRunLoopRef loop = NULL;
+static int initialized = 0;
+static CFMutableArrayRef     g_paths;
 static volatile bool done = false;
 
 static void fam_deinit()
 {
-    close(inotifyfd);
+    done = true;
+    CFRunLoopStop(loop);
 
-	pthread_cancel(g_event_loop_thread);
-	// NOTE: POSIX threads are (by default) only cancellable inside particular
-	// functions (like 'select'), so this should safely terminate while it's
-	// in select/FAMNextEvent/etc (and won't e.g. cancel while it's holding the
-	// mutex)
-
-	// Wait for the thread to finish
-	pthread_join(g_event_loop_thread, NULL);
+    // Wait for the thread to finish
+    pthread_join(g_event_loop_thread, NULL);
     std::cout << "thread join successfully" << std::endl;
+
 }
 
-static void event_loop_process_events()
+typedef std::map< std::string, std::map<std::string, struct dentry> > t_timestamp_map;
+typedef std::map<std::string, struct dentry> t_timestamp_inner_map;
+typedef std::map< std::string, std::map<std::string, struct dentry> >::iterator t_timestamp_map_iterator;
+typedef std::map<std::string, struct dentry>::iterator t_timestamp_inner_map_iterator;
+t_timestamp_map g_timestamps;
+char        path_buff[PATH_MAX];
+
+struct dentry
 {
-    char buffer[65535];
-    ssize_t r = read(inotifyfd, buffer, sizeof(buffer));
-    if (r <= 0)
-        return; 
-    size_t event_size; 
-    struct inotify_event *pevent; 
-    ssize_t buffer_i = 0;
-    while(buffer_i < r)
+    struct timespec ts;
+    off_t size;
+    bool is_dir;
+};
+
+static void dump_timestamps(t_timestamp_map& map)
+{
+    for (t_timestamp_map_iterator it = map.begin(); it != map.end(); it++)
     {
-        pevent = (struct inotify_event *) &buffer[buffer_i]; 
-        event_size = offsetof(struct inotify_event, name) + pevent->len;
-        NotificationEvent ne; 
-        ne.wd = pevent->wd;
-        ne.filename = pevent->name;
-        ne.code = pevent->mask;
-
-        pthread_mutex_lock(&g_mutex); 
-        g_notifications.push_back(ne); 
-        std::cout << "g_notifications.push_back" << std::endl;
-        pthread_mutex_unlock(&g_mutex); 
-
-        buffer_i += event_size;
+        std::cout << it->first << std::endl;
+        for (t_timestamp_inner_map_iterator it_inner = it->second.begin(); it_inner != it->second.end(); it_inner++)
+        {
+            std::cout << it_inner->first << std::endl;
+        }
     }
 }
 
-static inline add_paths(char* path)
+static void record_timestamps(t_timestamp_map* pmap, const char* path)
 {
+    struct stat st;
+    if (lstat(path, &st) == 0)
+    {
+        strcpy(path_buff, path);
+        char* dir = dirname(path_buff);
+        t_timestamp_map_iterator it = pmap->find(dir);
+        struct dentry d = {ts:st.st_mtimespec, size:st.st_size, is_dir: S_ISDIR(st.st_mode)};
+        if (it != pmap->end())
+        {
+            it->second.insert(std::pair<std::string, struct dentry>(path, d));
+        }
+        else
+        {
+            t_timestamp_inner_map inner_map;
+            inner_map.insert(std::pair<std::string, struct dentry>(path, d));
+            pmap->insert(std::pair<std::string, t_timestamp_inner_map>(dir, inner_map));
+        }
+    }
+}
+
+static inline void add_to_g_paths(const char* path)
+{
+    vfs::ForEachFile(path, (void *)record_timestamps, true, &g_timestamps);
+
     CFStringRef macpath = CFStringCreateWithCString(
         NULL,
-        (char*)path,
+        path,
         kCFStringEncodingUTF8
     );
     if (macpath == NULL) 
     {
         std::cerr << "ERROR: CFStringCreateWithCString() => NULL" << std::endl;
-	    CFRelease(cfArray);
-        return NULL;
+        return;
     }
     CFArrayInsertValueAtIndex(g_paths, 0, macpath);
     CFRelease(macpath);
+}
+
+static void compare_timestamps(t_timestamp_map& old_map, t_timestamp_map& new_map)
+{
+    #define time_equal(a, b) (a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec)
+
+    t_timestamp_map_iterator it_old;
+    t_timestamp_map_iterator it_new;
+    t_timestamp_inner_map_iterator it_old_inner;
+    t_timestamp_inner_map_iterator it_new_inner;
+    t_timestamp_inner_map inner_map;
+    for (it_old = old_map.begin(); it_old != old_map.end(); it_old++)
+    {
+        inner_map = it_old->second;
+        strcpy(path_buff, it_old->first.c_str());
+        it_new = new_map.find(dirname(path_buff));
+        std::cout << "dirname is " << dirname(path_buff) << std::endl;
+        for (it_old_inner = inner_map.begin(); it_old_inner != inner_map.end(); it_old_inner++)
+        {
+            if ((it_new == new_map.end()) || ((it_new_inner = it_new->second.find(it_old_inner->first)) == it_new->second.end()))
+            {
+                if(it_new == new_map.end())
+                {
+                    std::cout << "it_new == new_map.end()" << std::endl;
+                }
+                if(it_new_inner == it_new->second.end())
+                {
+                    std::cout << "it_new_inner == it_new->second.end()" << std::endl;
+                }
+                // deleted
+                DirWatchNotification dn(it_old_inner->first, DirWatchNotification::Deleted);
+                g_notifications.push_back(dn);
+            }
+            else if (!time_equal(it_new_inner->second.ts, it_old_inner->second.ts) || (it_new_inner->second.size != it_old_inner->second.size))
+            {
+                // updated
+                DirWatchNotification dn(it_old_inner->first, DirWatchNotification::Changed);
+                g_notifications.push_back(dn);
+            }
+        }
+    }
+    for (it_new = new_map.begin(); it_new != new_map.end(); it_new++)
+    {
+        inner_map = it_new->second;
+        it_old = old_map.find(it_new->first);
+        for (it_new_inner = inner_map.begin(); it_new_inner != inner_map.end(); it_new_inner++)
+        {
+            if ((it_old == old_map.end()) || ((it_old_inner = it_old->second.find(it_new_inner->first)) == it_old->second.end()))
+            {
+                // new
+                DirWatchNotification dn(it_new_inner->first, DirWatchNotification::Created);
+                g_notifications.push_back(dn);
+            }
+        }
+    }
+
+    #undef time_equal
+}
+
+static void fsevents_callback(FSEventStreamRef streamRef, void *clientCallBackInfo,
+                  int numEvents,
+                  const char *const eventPaths[],
+                  const FSEventStreamEventFlags *eventFlags,
+                  const uint64_t *eventIDs)
+{
+    for (int i=0; i < numEvents; i++)
+    {
+        bool recursive = false;
+        if (eventFlags[i] & kFSEventStreamEventFlagHistoryDone) 
+        {
+            std::cout << "Done processing historical events." << std::endl;
+            continue;
+        }
+        else if (eventFlags[i] & kFSEventStreamEventFlagRootChanged) 
+        {
+            // do not handle this flag temporarily
+            continue;
+        }
+        else if (eventFlags[i] & kFSEventStreamEventFlagMustScanSubDirs)
+        {
+            recursive = true;
+        }
+        t_timestamp_map new_fs;
+        vfs::ForEachFile(eventPaths[i], (void *)record_timestamps, recursive, &new_fs);
+        t_timestamp_map_iterator it_new;
+        t_timestamp_map_iterator it_g;
+        t_timestamp_map old_fs;
+        for (it_new = new_fs.begin(); it_new != new_fs.end(); it_new++)
+        {
+            it_g = g_timestamps.find(it_new->first);
+            if (it_g != g_timestamps.end())
+            {
+                old_fs.insert(std::pair<std::string, t_timestamp_inner_map>(it_new->first, it_new->second));
+            }
+        }
+        std::cout << "dumping g fs:" << std::endl;
+        dump_timestamps(g_timestamps);
+        std::cout << "dumping old fs:" << std::endl;
+        dump_timestamps(old_fs);
+        std::cout << "dumping new fs:" << std::endl;
+        dump_timestamps(new_fs);
+        compare_timestamps(old_fs, new_fs);
+        for (it_new = new_fs.begin(); it_new != new_fs.end(); it_new++)
+        {
+            g_timestamps.insert(std::pair<std::string, t_timestamp_inner_map>(it_new->first, it_new->second));
+        }
+    }
 }
 
 static void* event_loop(void*)
 {
     loop = CFRunLoopGetCurrent();
     FSEventStreamRef      stream_ref = NULL;
+    FSEventStreamEventId sinceWhen = kFSEventStreamEventIdSinceNow;
 
     do {
         stream_ref = FSEventStreamCreate(kCFAllocatorDefault,
                                     (FSEventStreamCallback)&fsevents_callback,
-                                    &context,
+                                    NULL,
                                     g_paths,
-                                    settings->since_when,
-                                    settings->latency,
+                                    sinceWhen,
+                                    0.3,
                                     kFSEventStreamCreateFlagNone);
+        FSEventStreamScheduleWithRunLoop(stream_ref, loop, kCFRunLoopDefaultMode);
+        if (!FSEventStreamStart(stream_ref))
+        {
+            std::cout << "Failed to start the FSEventStream" << std::endl;
+            return NULL;
+        }
+
         CFRunLoopRun();
         FSEventStreamFlushSync(stream_ref);
         FSEventStreamStop(stream_ref);
         FSEventStreamUnscheduleFromRunLoop(stream_ref, loop, kCFRunLoopDefaultMode);
         FSEventStreamInvalidate(stream_ref);
         FSEventStreamRelease(stream_ref);
+        sinceWhen = FSEventsGetCurrentEventId();
     }
-    while(!done);
-}
-
-int dir_watch_Delete(const char* path)
-{
+    while (!done);
+    return NULL;
 }
 
 int dir_watch_Add(const char* path, PDirWatch& dirWatch)
@@ -206,23 +270,25 @@ int dir_watch_Add(const char* path, PDirWatch& dirWatch)
         if (g_paths == NULL) 
         {
             std::cerr << "ERROR: CFArrayCreateMutable() => NULL" << std::endl;
-            return NULL;
+            return -1;
         }
+        add_to_g_paths(path);
 
-		if (pthread_create(&g_event_loop_thread, NULL, &event_loop, NULL)
+        if (pthread_create(&g_event_loop_thread, NULL, &event_loop, NULL))
         {
             std::cerr << "pthread_create failed" << std::endl;
             return -1;
         }
+        atexit(fam_deinit);
         initialized = 1;
     }
     else
     {
-        add_paths(path);
+        add_to_g_paths(path);
         CFRunLoopStop(loop);
     }
 
-	PDirWatch tmpDirWatch(new DirWatch);
+    PDirWatch tmpDirWatch(new DirWatch);
     dirWatch.swap(tmpDirWatch);
     dirWatch->path = path;
 
@@ -234,7 +300,7 @@ int dir_watch_Poll(DirWatchNotifications& notifications)
 {
     if (1 != initialized)
         return -1;
-	std::vector<NotificationEvent> polled_notifications;
+	std::vector<DirWatchNotification> polled_notifications;
 
 	pthread_mutex_lock(&g_mutex);
 	g_notifications.swap(polled_notifications);
@@ -248,37 +314,9 @@ int dir_watch_Poll(DirWatchNotifications& notifications)
     {
         std::cout << "polled_notifications.size is " << polled_notifications.size() << std::endl;
     }
-	for(size_t i = 0; i < polled_notifications.size(); ++i)
+	for (size_t i = 0; i < polled_notifications.size(); ++i)
     {
-		DirWatchNotification::EType type;
-		switch (polled_notifications[i].code)
-        {
-            case IN_MODIFY:
-                type = DirWatchNotification::Changed;
-                break;
-            case IN_CREATE: 
-                type = DirWatchNotification::Created; 
-                break;
-            case IN_DELETE: 
-                type = DirWatchNotification::Deleted; 
-                break;
-            default:
-                std::cout << "ignored event:" << polled_notifications[i].code << std::endl;
-                continue;
-        }
-        std::string filename;
-        std::map<int, DirWatch*>::iterator it = g_paths.find(polled_notifications[i].wd);
-        if (it != g_paths.end())
-        {
-            filename = it->second->path + "/" + polled_notifications[i].filename;
-        }
-        else
-        {
-            std::cout << "event of removed wd ignored" << std::endl;
-            continue;
-        }
-        std::cout << filename << std::endl;
-        notifications.push_back(DirWatchNotification(filename, type));
+        notifications.push_back(polled_notifications[i]);
     }
     return 0;
 }
