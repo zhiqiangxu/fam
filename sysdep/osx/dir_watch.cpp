@@ -6,6 +6,7 @@
 #include <sys/event.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <vector>
 #include <map>
 #include <string.h>
@@ -232,6 +233,7 @@ static void pipe_callback(CFFileDescriptorRef kq_cffd, CFOptionFlags callBackTyp
     char c;
     while(read(pipes[0], &c, 1) > 0);
     //CFRunLoopWakeUp(loop);
+    std::cout << "calling CFRunLoopStop" << std::endl;
     CFRunLoopStop(loop);
     std::cout << "CFRunLoopWakeUp return" << std::endl;
     CFFileDescriptorEnableCallBacks(fdref, kCFFileDescriptorReadCallBack);
@@ -296,6 +298,7 @@ static void* event_loop(void*)
         std::cout << "starting runloop.." << std::endl;
 
         CFRunLoopRun();
+        //CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2, false);
         std::cout << "CFRunLoopRun waken up" << std::endl;
         FSEventStreamFlushSync(stream_ref);
         FSEventStreamStop(stream_ref);
@@ -313,9 +316,15 @@ int dir_watch_Add(const char* path, PDirWatch& dirWatch)
     std::cout << path << std::endl;
     if (!initialized)
     {
-        if(0 != pipe(pipes))
+        if (0 != pipe(pipes))
         {
             std::cout << "pipe failed" << std::endl;
+            return -1;
+        }
+        unsigned long nb = 1;
+        if (-1 == ioctl(pipes[0], FIONBIO, &nb))
+        {
+            std::cout << "ioctl failed" << std::endl;
             return -1;
         }
         g_paths = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
