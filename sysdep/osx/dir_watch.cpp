@@ -11,10 +11,12 @@
 #include <string.h>
 #include <limits.h>
 #include <libgen.h>
+#include <unistd.h>
 #include "dir_watch.h"
 #include "file_utils.h"
 
 
+void cleanup_run_loop_signal_handler();
 
 int dir_watch_Delete(const char* path)
 {
@@ -43,10 +45,12 @@ CFRunLoopRef loop = NULL;
 static int initialized = 0;
 static CFMutableArrayRef     g_paths;
 static volatile bool done = false;
+static int pipes[2];
 
 static void fam_deinit()
 {
     done = true;
+    cleanup_run_loop_signal_handler();
     CFRunLoopStop(loop);
 
     // Wait for the thread to finish
@@ -133,21 +137,11 @@ static void compare_timestamps(t_timestamp_map& old_map, t_timestamp_map& new_ma
     for (it_old = old_map.begin(); it_old != old_map.end(); it_old++)
     {
         inner_map = it_old->second;
-        strcpy(path_buff, it_old->first.c_str());
-        it_new = new_map.find(dirname(path_buff));
-        std::cout << "dirname is " << dirname(path_buff) << std::endl;
+        it_new = new_map.find(it_old->first);
         for (it_old_inner = inner_map.begin(); it_old_inner != inner_map.end(); it_old_inner++)
         {
             if ((it_new == new_map.end()) || ((it_new_inner = it_new->second.find(it_old_inner->first)) == it_new->second.end()))
             {
-                if(it_new == new_map.end())
-                {
-                    std::cout << "it_new == new_map.end()" << std::endl;
-                }
-                if(it_new_inner == it_new->second.end())
-                {
-                    std::cout << "it_new_inner == it_new->second.end()" << std::endl;
-                }
                 // deleted
                 DirWatchNotification dn(it_old_inner->first, DirWatchNotification::Deleted);
                 g_notifications.push_back(dn);
@@ -184,6 +178,7 @@ static void fsevents_callback(FSEventStreamRef streamRef, void *clientCallBackIn
                   const FSEventStreamEventFlags *eventFlags,
                   const uint64_t *eventIDs)
 {
+    std::cout << "fsevents_callback" << std::endl;
     for (int i=0; i < numEvents; i++)
     {
         bool recursive = false;
@@ -211,7 +206,7 @@ static void fsevents_callback(FSEventStreamRef streamRef, void *clientCallBackIn
             it_g = g_timestamps.find(it_new->first);
             if (it_g != g_timestamps.end())
             {
-                old_fs.insert(std::pair<std::string, t_timestamp_inner_map>(it_new->first, it_new->second));
+                old_fs.insert(std::pair<std::string, t_timestamp_inner_map>(it_g->first, it_g->second));
             }
         }
         std::cout << "dumping g fs:" << std::endl;
@@ -223,9 +218,58 @@ static void fsevents_callback(FSEventStreamRef streamRef, void *clientCallBackIn
         compare_timestamps(old_fs, new_fs);
         for (it_new = new_fs.begin(); it_new != new_fs.end(); it_new++)
         {
-            g_timestamps.insert(std::pair<std::string, t_timestamp_inner_map>(it_new->first, it_new->second));
+            g_timestamps[it_new->first] = it_new->second;
         }
     }
+}
+
+static CFFileDescriptorRef fdref = NULL;
+static CFRunLoopSourceRef fd_rl_src = NULL;
+
+static void pipe_callback(CFFileDescriptorRef kq_cffd, CFOptionFlags callBackTypes, void *info)
+{
+    std::cout << "pipe_callback" << std::endl;
+    char c;
+    while(read(pipes[0], &c, 1) > 0);
+    //CFRunLoopWakeUp(loop);
+    CFRunLoopStop(loop);
+    std::cout << "CFRunLoopWakeUp return" << std::endl;
+    CFFileDescriptorEnableCallBacks(fdref, kCFFileDescriptorReadCallBack);
+}
+
+int setup_run_loop_pipe_read_handler()
+{
+    fdref = CFFileDescriptorCreate(NULL, pipes[0], 1, pipe_callback, NULL);
+    if (fdref == NULL)
+    {
+        return -1;
+    }
+
+    fd_rl_src = CFFileDescriptorCreateRunLoopSource(NULL, fdref, (CFIndex)0);
+    if (fd_rl_src == NULL)
+    {
+        CFFileDescriptorInvalidate(fdref);
+        CFRelease(fdref);
+        fdref = NULL;
+        return -1;
+    }
+
+    CFRunLoopAddSource(loop, fd_rl_src, kCFRunLoopDefaultMode);
+    CFFileDescriptorEnableCallBacks(fdref, kCFFileDescriptorReadCallBack);
+
+    return 0;
+}
+
+void cleanup_run_loop_signal_handler()
+{
+    CFRunLoopRemoveSource(loop, fd_rl_src, kCFRunLoopDefaultMode);
+
+    CFFileDescriptorInvalidate(fdref);
+    CFRelease(fd_rl_src);
+    CFRelease(fdref);
+
+    fd_rl_src = NULL;
+    fdref   = NULL;
 }
 
 static void* event_loop(void*)
@@ -233,6 +277,7 @@ static void* event_loop(void*)
     loop = CFRunLoopGetCurrent();
     FSEventStreamRef      stream_ref = NULL;
     FSEventStreamEventId sinceWhen = kFSEventStreamEventIdSinceNow;
+    setup_run_loop_pipe_read_handler();
 
     do {
         stream_ref = FSEventStreamCreate(kCFAllocatorDefault,
@@ -248,8 +293,10 @@ static void* event_loop(void*)
             std::cout << "Failed to start the FSEventStream" << std::endl;
             return NULL;
         }
+        std::cout << "starting runloop.." << std::endl;
 
         CFRunLoopRun();
+        std::cout << "CFRunLoopRun waken up" << std::endl;
         FSEventStreamFlushSync(stream_ref);
         FSEventStreamStop(stream_ref);
         FSEventStreamUnscheduleFromRunLoop(stream_ref, loop, kCFRunLoopDefaultMode);
@@ -266,8 +313,13 @@ int dir_watch_Add(const char* path, PDirWatch& dirWatch)
     std::cout << path << std::endl;
     if (!initialized)
     {
+        if(0 != pipe(pipes))
+        {
+            std::cout << "pipe failed" << std::endl;
+            return -1;
+        }
         g_paths = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-        if (g_paths == NULL) 
+        if (g_paths == NULL)
         {
             std::cerr << "ERROR: CFArrayCreateMutable() => NULL" << std::endl;
             return -1;
@@ -284,8 +336,8 @@ int dir_watch_Add(const char* path, PDirWatch& dirWatch)
     }
     else
     {
+        write(pipes[1], "1", 1);
         add_to_g_paths(path);
-        CFRunLoopStop(loop);
     }
 
     PDirWatch tmpDirWatch(new DirWatch);
