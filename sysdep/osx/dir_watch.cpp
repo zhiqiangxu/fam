@@ -41,7 +41,8 @@ struct DirWatch
 
 
 static pthread_t g_event_loop_thread;
-static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_mutex_notifications = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_mutex_timestamps = PTHREAD_MUTEX_INITIALIZER;
 static std::vector<DirWatchNotification> g_notifications;
 static CFRunLoopRef loop = NULL;
 static int initialized = 0;
@@ -130,7 +131,9 @@ static void remove_timestamps(t_timestamp_map* pmap, const char* path)
 
 static inline void add_to_g_paths(const char* path)
 {
+    pthread_mutex_lock(&g_mutex_timestamps);
     vfs::ForEachFile(path, (void *)record_timestamps, true, &g_timestamps);
+    pthread_mutex_unlock(&g_mutex_timestamps);
 
     CFStringRef macpath = CFStringCreateWithCString(
         NULL,
@@ -166,13 +169,17 @@ static void compare_timestamps(t_timestamp_map& old_map, t_timestamp_map& new_ma
             {
                 // deleted
                 DirWatchNotification dn(it_old_inner->first, DirWatchNotification::Deleted);
+                pthread_mutex_lock(&g_mutex_notifications);
                 g_notifications.push_back(dn);
+                pthread_mutex_unlock(&g_mutex_notifications);
             }
             else if (!time_equal(it_new_inner->second.ts, it_old_inner->second.ts) || (it_new_inner->second.size != it_old_inner->second.size))
             {
                 // updated
                 DirWatchNotification dn(it_old_inner->first, DirWatchNotification::Changed);
+                pthread_mutex_lock(&g_mutex_notifications);
                 g_notifications.push_back(dn);
+                pthread_mutex_unlock(&g_mutex_notifications);
             }
         }
     }
@@ -186,7 +193,9 @@ static void compare_timestamps(t_timestamp_map& old_map, t_timestamp_map& new_ma
             {
                 // new
                 DirWatchNotification dn(it_new_inner->first, DirWatchNotification::Created);
+                pthread_mutex_lock(&g_mutex_notifications);
                 g_notifications.push_back(dn);
+                pthread_mutex_unlock(&g_mutex_notifications);
             }
         }
     }
@@ -223,6 +232,7 @@ static void fsevents_callback(FSEventStreamRef streamRef, void *clientCallBackIn
         t_timestamp_map_iterator it_new;
         t_timestamp_map_iterator it_g;
         t_timestamp_map old_fs;
+        pthread_mutex_lock(&g_mutex_timestamps);
         for (it_new = new_fs.begin(); it_new != new_fs.end(); it_new++)
         {
             it_g = g_timestamps.find(it_new->first);
@@ -231,6 +241,11 @@ static void fsevents_callback(FSEventStreamRef streamRef, void *clientCallBackIn
                 old_fs.insert(std::pair<std::string, t_timestamp_inner_map>(it_g->first, it_g->second));
             }
         }
+        for (it_new = new_fs.begin(); it_new != new_fs.end(); it_new++)
+        {
+            g_timestamps[it_new->first] = it_new->second;
+        }
+        pthread_mutex_unlock(&g_mutex_timestamps);
         std::cout << "dumping g fs:" << std::endl;
         dump_timestamps(g_timestamps);
         std::cout << "dumping old fs:" << std::endl;
@@ -238,10 +253,6 @@ static void fsevents_callback(FSEventStreamRef streamRef, void *clientCallBackIn
         std::cout << "dumping new fs:" << std::endl;
         dump_timestamps(new_fs);
         compare_timestamps(old_fs, new_fs);
-        for (it_new = new_fs.begin(); it_new != new_fs.end(); it_new++)
-        {
-            g_timestamps[it_new->first] = it_new->second;
-        }
     }
 }
 
@@ -394,7 +405,9 @@ int dir_watch_Delete(const char* path)
     CFRelease(macpath);
     std::cout << "idx is " << idx << std::endl;
     CFArrayRemoveValueAtIndex(g_paths, idx);
+    pthread_mutex_lock(&g_mutex_timestamps);
     vfs::ForEachFile(path, (void *)remove_timestamps, true, &g_timestamps);
+    pthread_mutex_unlock(&g_mutex_timestamps);
     write(pipes[1], "1", 1);
     return 0;
 }
@@ -405,9 +418,9 @@ int dir_watch_Poll(DirWatchNotifications& notifications)
         return -1;
 	std::vector<DirWatchNotification> polled_notifications;
 
-	pthread_mutex_lock(&g_mutex);
+	pthread_mutex_lock(&g_mutex_notifications);
 	g_notifications.swap(polled_notifications);
-	pthread_mutex_unlock(&g_mutex);
+	pthread_mutex_unlock(&g_mutex_notifications);
 
     std::cout << "polled_notifications.size is " << polled_notifications.size() << std::endl;
 
