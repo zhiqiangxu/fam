@@ -18,6 +18,7 @@ void onsig(int signal)
 extern "C" int main(int argc, char* argv[])
 {
 	PDirWatch dirWatch1;
+	PDirWatch dirWatch2;
     DirWatchNotifications notifications;
     signal(SIGINT, onsig);
     if (0 != dir_watch_Add("/Users/xuzhiqiang/Develop/c/fam/sysdep/linux", dirWatch1))
@@ -26,12 +27,15 @@ extern "C" int main(int argc, char* argv[])
 		return EXIT_FAILURE;
     }
     std::cout << "dirWatch1 OK" << std::endl;
-    if (0 != dir_watch_Add("/Users/xuzhiqiang/Develop/c/fam/sysdep/osx", dirWatch1))
+    if (0 != dir_watch_Add("/Users/xuzhiqiang/Develop/c/fam/sysdep/osx", dirWatch2))
     {
 		std::cerr << "dir_watch_Add fail" << std::endl;
 		return EXIT_FAILURE;
     }
     std::cout << "dirWatch2 OK" << std::endl;
+    sleep(2);
+    std::cout << "removing dirWatch1 from watch" << std::endl;
+    dirWatch1.reset();
 
     do {
         sleep(4);

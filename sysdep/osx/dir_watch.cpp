@@ -17,12 +17,13 @@
 #include "file_utils.h"
 
 
-void cleanup_run_loop_signal_handler();
+static int setup_run_loop_pipe_read_handler();
+static void cleanup_run_loop_pipe_read_handler();
+static void fam_deinit();
 
-int dir_watch_Delete(const char* path)
-{
-    return 0;
-}
+int dir_watch_Add(const char* path, PDirWatch& dirWatch);
+static int dir_watch_Delete(const char* path);
+int dir_watch_Poll(DirWatchNotifications& notifications);
 
 struct DirWatch
 {
@@ -42,7 +43,7 @@ struct DirWatch
 static pthread_t g_event_loop_thread;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static std::vector<DirWatchNotification> g_notifications;
-CFRunLoopRef loop = NULL;
+static CFRunLoopRef loop = NULL;
 static int initialized = 0;
 static CFMutableArrayRef     g_paths;
 static volatile bool done = false;
@@ -51,7 +52,7 @@ static int pipes[2];
 static void fam_deinit()
 {
     done = true;
-    cleanup_run_loop_signal_handler();
+    cleanup_run_loop_pipe_read_handler();
     CFRunLoopStop(loop);
 
     // Wait for the thread to finish
@@ -64,8 +65,8 @@ typedef std::map< std::string, std::map<std::string, struct dentry> > t_timestam
 typedef std::map<std::string, struct dentry> t_timestamp_inner_map;
 typedef std::map< std::string, std::map<std::string, struct dentry> >::iterator t_timestamp_map_iterator;
 typedef std::map<std::string, struct dentry>::iterator t_timestamp_inner_map_iterator;
-t_timestamp_map g_timestamps;
-char        path_buff[PATH_MAX];
+static t_timestamp_map g_timestamps;
+static char        path_buff[PATH_MAX];
 
 struct dentry
 {
@@ -108,6 +109,25 @@ static void record_timestamps(t_timestamp_map* pmap, const char* path)
     }
 }
 
+static void remove_timestamps(t_timestamp_map* pmap, const char* path)
+{
+    struct stat st;
+    if (lstat(path, &st) == 0)
+    {
+        strcpy(path_buff, path);
+        char* dir = dirname(path_buff);
+        t_timestamp_map_iterator it = pmap->find(dir);
+        if (it != pmap->end())
+        {
+            t_timestamp_inner_map_iterator it_inner = it->second.find(path);
+            if (it_inner != it->second.end())
+            {
+                it->second.erase(it_inner);
+            }
+        }
+    }
+}
+
 static inline void add_to_g_paths(const char* path)
 {
     vfs::ForEachFile(path, (void *)record_timestamps, true, &g_timestamps);
@@ -122,7 +142,8 @@ static inline void add_to_g_paths(const char* path)
         std::cerr << "ERROR: CFStringCreateWithCString() => NULL" << std::endl;
         return;
     }
-    CFArrayInsertValueAtIndex(g_paths, 0, macpath);
+    CFArrayAppendValue(g_paths, macpath);
+    CFArraySortValues(g_paths, CFRangeMake(0, CFArrayGetCount(g_paths)), (CFComparatorFunction)CFStringCompare, NULL);
     CFRelease(macpath);
 }
 
@@ -231,7 +252,7 @@ static void pipe_callback(CFFileDescriptorRef kq_cffd, CFOptionFlags callBackTyp
 {
     std::cout << "pipe_callback" << std::endl;
     char c;
-    while(read(pipes[0], &c, 1) > 0);
+    while (read(pipes[0], &c, 1) > 0);
     //CFRunLoopWakeUp(loop);
     std::cout << "calling CFRunLoopStop" << std::endl;
     CFRunLoopStop(loop);
@@ -239,7 +260,7 @@ static void pipe_callback(CFFileDescriptorRef kq_cffd, CFOptionFlags callBackTyp
     CFFileDescriptorEnableCallBacks(fdref, kCFFileDescriptorReadCallBack);
 }
 
-int setup_run_loop_pipe_read_handler()
+static int setup_run_loop_pipe_read_handler()
 {
     fdref = CFFileDescriptorCreate(NULL, pipes[0], 1, pipe_callback, NULL);
     if (fdref == NULL)
@@ -262,7 +283,7 @@ int setup_run_loop_pipe_read_handler()
     return 0;
 }
 
-void cleanup_run_loop_signal_handler()
+static void cleanup_run_loop_pipe_read_handler()
 {
     CFRunLoopRemoveSource(loop, fd_rl_src, kCFRunLoopDefaultMode);
 
@@ -345,8 +366,8 @@ int dir_watch_Add(const char* path, PDirWatch& dirWatch)
     }
     else
     {
-        write(pipes[1], "1", 1);
         add_to_g_paths(path);
+        write(pipes[1], "1", 1);
     }
 
     PDirWatch tmpDirWatch(new DirWatch);
@@ -356,6 +377,27 @@ int dir_watch_Add(const char* path, PDirWatch& dirWatch)
     return 0;
 }
 
+int dir_watch_Delete(const char* path)
+{
+    CFStringRef macpath = CFStringCreateWithCString(
+        NULL,
+        path,
+        kCFStringEncodingUTF8
+    );
+    if (macpath == NULL) 
+    {
+        std::cerr << "ERROR: CFStringCreateWithCString() => NULL" << std::endl;
+        return -1;
+    }
+    std::cout << "dir_watch_Delete" << std::endl;
+    CFIndex idx = CFArrayBSearchValues(g_paths, CFRangeMake(0, CFArrayGetCount(g_paths)), macpath, (CFComparatorFunction)CFStringCompare, NULL);
+    CFRelease(macpath);
+    std::cout << "idx is " << idx << std::endl;
+    CFArrayRemoveValueAtIndex(g_paths, idx);
+    vfs::ForEachFile(path, (void *)remove_timestamps, true, &g_timestamps);
+    write(pipes[1], "1", 1);
+    return 0;
+}
 
 int dir_watch_Poll(DirWatchNotifications& notifications)
 {
@@ -367,14 +409,8 @@ int dir_watch_Poll(DirWatchNotifications& notifications)
 	g_notifications.swap(polled_notifications);
 	pthread_mutex_unlock(&g_mutex);
 
-    if (0 == polled_notifications.size())
-    {
-        std::cout << "polled_notifications.size is 0" << std::endl;
-    }
-    else
-    {
-        std::cout << "polled_notifications.size is " << polled_notifications.size() << std::endl;
-    }
+    std::cout << "polled_notifications.size is " << polled_notifications.size() << std::endl;
+
 	for (size_t i = 0; i < polled_notifications.size(); ++i)
     {
         notifications.push_back(polled_notifications[i]);
