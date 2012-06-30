@@ -10,7 +10,7 @@
 #include "dir_watch.h"
 #include <signal.h>
 
-#define WATCH_MASK IN_CREATE | IN_DELETE | IN_MODIFY
+#define WATCH_MASK IN_CREATE | IN_DELETE | IN_CLOSE_WRITE
 
 static int inotifyfd; 
 static std::map<int, DirWatch*> g_paths;
@@ -189,7 +189,7 @@ int dir_watch_Poll(DirWatchNotifications& notifications)
 		DirWatchNotification::EType type;
 		switch (polled_notifications[i].code)
         {
-            case IN_MODIFY:
+            case IN_CLOSE_WRITE:
                 type = DirWatchNotification::Changed;
                 break;
             case IN_CREATE: 
